@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "procurement-decision-api"
+version = "0.1.0"
+description = "FastAPI service that drafts AI Procurement Decision Cards (Kinetic Gain Protocol Suite spec #11) from a buyer rubric and vendor Suite documents."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Miz Causevic" }]
+requires-python = ">=3.11"
+keywords = [
+    "procurement",
+    "ai-governance",
+    "fastapi",
+    "decision-intelligence",
+    "kinetic-gain-protocol-suite",
+    "nist-ai-rmf",
+    "omb-m-24-10",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.7",
+    "httpx>=0.27",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+procurement-decision-api = "procurement_decision_api.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/mizcausevic-dev/procurement-decision-api"
+Spec = "https://github.com/mizcausevic-dev/ai-procurement-decision-spec"
+"Kinetic Gain Suite" = "https://suite.kineticgain.com/"
+"NIST RMF Crosswalk" = "https://suite.kineticgain.com/docs/nist-rmf-crosswalk.md"
+"Bug Tracker" = "https://github.com/mizcausevic-dev/procurement-decision-api/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/procurement_decision_api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+ignore = ["E501"]  # we let ruff format pick the line length
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
