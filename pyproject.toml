@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "procurement-decision-api"
-version = "0.1.0"
-description = "FastAPI service that drafts AI Procurement Decision Cards (Kinetic Gain Protocol Suite spec #11) from a buyer rubric and vendor Suite documents."
+version = "0.1.1"
+description = "FastAPI service that drafts AI Procurement Decision Cards (Kinetic Gain Protocol Suite spec #11) from a buyer rubric and vendor Suite documents. Optional audit-stream-py integration via AUDIT_STREAM_URL env var."
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Miz Causevic" }]

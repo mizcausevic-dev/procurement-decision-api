@@ -9,4 +9,4 @@ The Decision Card is the buyer-side artifact. This service is the
 machine that produces it.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

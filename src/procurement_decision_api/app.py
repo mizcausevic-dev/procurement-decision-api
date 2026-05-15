@@ -22,7 +22,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, status
 from pydantic import ValidationError
 
-from . import __version__
+from . import __version__, audit_stream
 from .drafter import DraftError, draft_decision_card
 from .fetcher import DEFAULT_TIMEOUT_S, fetch_documents
 from .models import DecisionCard, DraftRequest, DraftResponse
@@ -111,6 +111,22 @@ async def draft(request: DraftRequest) -> DraftResponse:
         card, inferred = draft_decision_card(request, fetched_documents=fetched)
     except DraftError as err:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err)) from err
+
+    # Best-effort audit-stream-py emission. Silent no-op when
+    # AUDIT_STREAM_URL is unset; failures are logged + swallowed.
+    await audit_stream.emit(
+        http_client,
+        kind="decision_card_drafted",
+        payload={
+            "decision_id": card.decision_id,
+            "vendor": card.subject.vendor_name,
+            "status": card.decision.status,
+            "buyer": card.buyer.name,
+            "documents_fetched": len(fetched),
+            "fetch_errors": len(errors),
+            "inferred_status": inferred,
+        },
+    )
 
     return DraftResponse(
         draft=card,
