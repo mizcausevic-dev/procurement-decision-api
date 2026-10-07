@@ -4,9 +4,8 @@ Assemble a Draft Decision Card from a DraftRequest + fetched documents.
 This is the heart of the service. Order of operations:
 
   1. Compute documents_reviewed[] from the fetched documents (URL, hash, time).
-  2. Keep the draft pending unless the caller explicitly proposes a status.
-  3. If status requires conditions and the caller supplied none, raise a
-     400-equivalent error (the caller should review the rubric and fill them in).
+  2. Keep the draft pending and return a proposed or rubric status separately.
+  3. Keep caller conditions for a later authorized review.
   4. Compose a rationale (caller-supplied or generated).
   5. Pack the Decision Card and run Pydantic validation — including the
      superRefine-equivalent rules in the model.
@@ -55,20 +54,8 @@ def draft_decision_card(
 
     # 2. A rubric suggestion is advisory; never turn it into an approval.
     suggested: DecisionStatus | None = None
-    if req.proposed_status is not None:
-        status = req.proposed_status
-    else:
-        status = "pending"
-        suggested = infer_status(req.rubric)
-
-    # 3. conditions check
-    if status in ("approved-with-conditions", "rejected-with-remediation"):
-        if not req.conditions:
-            raise DraftError(
-                f"decision.status={status} requires conditions, "
-                "but the request did not supply any. Provide conditions "
-                "or choose a different proposed_status."
-            )
+    status: DecisionStatus = "pending"
+    suggested = req.proposed_status if req.proposed_status is not None else infer_status(req.rubric)
 
     if req.publication and req.publication.is_public is True:
         raise DraftError("A draft cannot claim publication.is_public=true; publish only after buyer review")
@@ -79,7 +66,7 @@ def draft_decision_card(
     else:
         rationale = compose_rationale(
             req.rubric,
-            status=status,
+            status=suggested,
             vendor_name=req.vendor_name,
             product_name=req.product_name,
             documents_count=len(docs_reviewed),

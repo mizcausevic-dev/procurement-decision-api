@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from procurement_decision_api import app as app_module
 from procurement_decision_api.app import app
+from procurement_decision_api.limits import MAX_REQUEST_BYTES, SlidingWindowLimiter
 
 SAMPLE_AEO_DOC = {
     "aeo_version": "0.1",
@@ -63,12 +64,19 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """TestClient that intercepts HTTP calls to the mocked vendor."""
     monkeypatch.setenv("API_TOKEN", TEST_API_TOKEN)
     monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "acmetutor.example")
+
+    async def public_dns(_host: str) -> list[str]:
+        return ["1.1.1.1"]
+
+    monkeypatch.setattr("procurement_decision_api.fetcher._resolve_host_addresses", public_dns)
+    monkeypatch.setattr(app.state, "rate_limiter", SlidingWindowLimiter())
     transport = httpx.MockTransport(_vendor_router)
     # Capture the real AsyncClient class BEFORE we patch the symbol; otherwise
     # the factory would call its own patched self and recurse infinitely.
     real_async_client = httpx.AsyncClient
 
     def _install_mock_client(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        assert _kwargs["trust_env"] is False
         return real_async_client(transport=transport, follow_redirects=False)
 
     # Replace the lifespan's client construction. Lifespan runs on first request.
@@ -121,10 +129,13 @@ class TestDraft:
         assert len(body["documents_fetched"]) == 1
         assert body["documents_fetched"][0]["type"] == "aeo"
         assert body["documents_fetched"][0]["content_hash"].startswith("sha256:")
+        assert body["document_hashes"][0]["hash_profile"] == "jcs-rfc8785-v1"
+        assert body["document_hashes"][0]["content_hash"].startswith("sha256:")
         assert body["fetch_errors"] == []
+        assert r.headers["Cache-Control"] == "no-store"
 
     def test_fail_criterion_requires_conditions(self, client: TestClient) -> None:
-        """When inference yields rejected-with-remediation, the request must supply conditions."""
+        """A missing condition does not turn a proposed rejection into an official decision."""
         req = self._base_request(
             proposed_status="rejected-with-remediation",
             rubric=[
@@ -132,8 +143,9 @@ class TestDraft:
             ],
         )
         r = client.post("/decisions/draft", json=req)
-        assert r.status_code == 400
-        assert "conditions" in r.json()["detail"]
+        assert r.status_code == 200
+        assert r.json()["draft"]["decision"]["status"] == "pending"
+        assert r.json()["suggested_status"] == "rejected-with-remediation"
 
     def test_fail_criterion_with_conditions_works(self, client: TestClient) -> None:
         req = self._base_request(
@@ -143,7 +155,8 @@ class TestDraft:
         )
         r = client.post("/decisions/draft", json=req)
         assert r.status_code == 200
-        assert r.json()["draft"]["decision"]["status"] == "rejected-with-remediation"
+        assert r.json()["draft"]["decision"]["status"] == "pending"
+        assert r.json()["suggested_status"] == "rejected-with-remediation"
 
     def test_partial_criterion_produces_approved_with_conditions(self, client: TestClient) -> None:
         req = self._base_request(
@@ -167,7 +180,14 @@ class TestDraft:
         assert r.status_code == 200
         body = r.json()
         assert body["draft"]["decision"]["status"] == "pending"
-        assert body["suggested_status"] is None
+        assert body["suggested_status"] == "pending"
+
+    def test_approved_proposal_cannot_approve_unsigned_draft(self, client: TestClient) -> None:
+        r = client.post("/decisions/draft", json=self._base_request(proposed_status="approved"))
+        assert r.status_code == 200
+        assert r.json()["draft"]["decision"]["status"] == "pending"
+        assert r.json()["suggested_status"] == "approved"
+        assert "Decision status remains pending" in r.json()["draft"]["rationale"]
 
     def test_fetch_errors_dont_fail_the_draft(self, client: TestClient) -> None:
         req = self._base_request(
@@ -193,6 +213,7 @@ class TestDraft:
         assert r.status_code == 200
         body = r.json()
         assert body["documents_fetched"] == []
+        assert body["document_hashes"] == []
         assert any("invalid JSON" in e for e in body["fetch_errors"])
 
     def test_no_fetch_targets_still_works(self, client: TestClient) -> None:
@@ -256,6 +277,19 @@ class TestDraft:
             "/decisions/draft", json=self._base_request(), headers={"Authorization": "Bearer wrong"}
         )
         assert r.status_code == 401
+        assert r.headers["Cache-Control"] == "no-store"
+
+    def test_request_body_limit(self, client: TestClient) -> None:
+        r = client.post("/decisions/draft", content=b"x" * (MAX_REQUEST_BYTES + 1))
+        assert r.status_code == 413
+
+    def test_auth_rate_limit(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(app.state, "rate_limiter", SlidingWindowLimiter(limit=2))
+        assert client.post("/decisions/draft", json=self._base_request(fetch_targets=[])).status_code == 200
+        assert client.post("/decisions/draft", json=self._base_request(fetch_targets=[])).status_code == 200
+        blocked = client.post("/decisions/draft", json=self._base_request(fetch_targets=[]))
+        assert blocked.status_code == 429
+        assert int(blocked.headers["Retry-After"]) >= 1
 
     def test_missing_configured_token_fails_closed(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -268,6 +302,13 @@ class TestDraft:
         req = self._base_request(fetch_targets=self._base_request()["fetch_targets"] * 17)
         r = client.post("/decisions/draft", json=req)
         assert r.status_code == 422
+
+    def test_invalid_draft_error_omits_input_value(self, client: TestClient) -> None:
+        req = self._base_request()
+        req["buyer"] = {"name": "Private Buyer Name", "type": "invalid-type"}
+        r = client.post("/decisions/draft", json=req)
+        assert r.status_code == 422
+        assert "Private Buyer Name" not in r.text
 
     def test_audit_event_omits_identifiers(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         captured: list[dict[str, Any]] = []
@@ -301,17 +342,24 @@ class TestValidate:
         r = client.post("/decisions/validate", json=self._valid_card())
         assert r.status_code == 200
         body = r.json()
-        assert body["valid"] is True
-        assert body["status"] == "approved"
-        assert body["documents_reviewed"] == 0
+        assert body["structure_valid"] is True
+        assert body["claimed_status"] == "approved"
+        assert body["authority_verified"] is False
+        assert body["signatures_verified"] is False
+        assert body["documents_referenced"] == 0
+        assert "buyer" not in body
+        assert "vendor" not in body
+        assert r.headers["Cache-Control"] == "no-store"
 
     def test_missing_required_field(self, client: TestClient) -> None:
         card = self._valid_card()
+        card["buyer"]["name"] = "Private Buyer Name"
         del card["rationale"]
         r = client.post("/decisions/validate", json=card)
         assert r.status_code == 422
         body = r.json()
-        assert body["detail"]["valid"] is False
+        assert body["detail"]["structure_valid"] is False
+        assert "Private Buyer Name" not in r.text
 
     def test_conditional_rule_violation(self, client: TestClient) -> None:
         card = self._valid_card()

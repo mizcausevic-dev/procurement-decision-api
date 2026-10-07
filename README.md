@@ -103,14 +103,19 @@ curl -s http://localhost:8088/decisions/draft \
 
 The response includes:
 - `draft` — a v0.1 Decision Card draft. With no `proposed_status`, `decision.status` stays `pending`. The service does not sign or publish it.
-- `documents_fetched[]` — each vendor URL with its retrieval timestamp + sha256 content hash
+- `documents_fetched[]` — each vendor URL with its retrieval timestamp and legacy Python sha256 content hash in the v0.1 card shape
+- `document_hashes[]` — informational RFC 8785 JCS hashes with `hash_profile: jcs-rfc8785-v1`, aligned with `hash-attestation-rs` v0.2. This response metadata is outside the unsigned card.
 - `fetch_errors[]` — per-target retrieval errors (the draft doesn't fail wholesale on one missing URL)
-- `suggested_status` — an advisory status inferred from the buyer-supplied rubric; it does not authorize approval
+- `suggested_status` — an advisory caller proposal, or a status inferred from the buyer-supplied rubric when no proposal is supplied; it does not authorize approval
+
+### v0.2.0 status and hash migration
+
+The unreleased v0.2.0 API always emits `draft.decision.status=pending`, even when `proposed_status` is `approved`, `rejected`, or another nonpending value. That value appears only in `suggested_status`. Callers of v0.1.1 that treated the generated card as an approved or rejected decision must add a separate buyer review and signing workflow. The validation endpoint now returns `structure_valid` and `claimed_status` instead of `valid` and `status`; it omits buyer/vendor identity and reports `authority_verified:false` and `signatures_verified:false`. `documents_fetched[].content_hash` and `draft.subject.documents_reviewed[].content_hash` keep the v0.1.1 Python algorithm for schema compatibility. Use the profiled `document_hashes[]` only as informational comparison data. The upstream v0.1 card schema has no hash-profile field, and this service does not verify vendor signatures or sign its response.
 
 ## What the service does
 
-1. **Fetches** up to 16 operator-allowlisted HTTPS `/.well-known/*.json` URLs, without redirects, encoded paths, or query strings, concurrently with httpx. Each response is streamed with a 2 MB cap and 10 s total timeout. Missing `FETCH_ALLOWED_HOSTS` rejects requests with fetch targets.
-2. **Suggests** a status from the buyer-supplied rubric if you didn't supply `proposed_status`; the draft itself remains `pending`. The suggestion rules:
+1. **Fetches** up to 16 operator-allowlisted HTTPS `/.well-known/*.json` URLs, without redirects, encoded paths, or query strings, concurrently with httpx. It rejects hosts whose DNS answers contain private or other non-public IPs at preflight time. Each response is streamed with a 2 MB cap and 10 s total timeout. Missing `FETCH_ALLOWED_HOSTS` rejects requests with fetch targets.
+2. **Suggests** a status from the buyer-supplied rubric if you didn't supply `proposed_status`; the draft itself always remains `pending`. The suggestion rules:
    - Any `fail` → `rejected-with-remediation`
    - Any `partial` or `pass-with-condition` → `approved-with-conditions`
    - All `pass` → `approved`
@@ -129,7 +134,7 @@ The response includes:
 | GET    | `/`                        | Service info + relevant links |
 | GET    | `/healthz`                 | Liveness probe (always 200 if the process is running) |
 | POST   | `/decisions/draft`         | Produce a Draft Decision Card |
-| POST   | `/decisions/validate`      | Check an existing Decision Card against this service's v0.1 model |
+| POST   | `/decisions/validate`      | Check a card's v0.1 structure; does not verify authority or signatures |
 | GET    | `/docs`                    | Interactive OpenAPI documentation (Swagger UI) |
 | GET    | `/openapi.json`            | Machine-readable API schema |
 
@@ -139,7 +144,7 @@ The service offers buyers a structured way to record their own AI procurement re
 
 The AI Procurement Decision Card spec defines a machine-readable format for buyer decisions. Here, a reviewer enters the rubric judgments and points the service at vendor declarations. The result still needs buyer review, a decision-authority check, and any required privacy or legal review before signing or publication.
 
-The draft cites fetched declarations by URL, retrieval time, and content hash. Hashes can help detect later content changes only when producer and verifier use the same canonicalization contract. This package retains the published Python v0.1.1 hash algorithm for compatibility; it is not interoperable with the Rust attestation tool for all JSON values, including non-ASCII strings and exponent-form numbers. Do not use these hashes as cross-language proof of origin or unchanged content until a shared, versioned canonicalization rule is implemented and tested.
+The draft cites fetched declarations by URL, retrieval time, and a legacy content hash. Hashes can help detect later content changes only when producer and verifier use the same canonicalization contract. The response also exposes versioned RFC 8785 hashes that match the Rust attestation tool's `jcs-rfc8785-v1` profile on a shared Unicode, exponent, negative-zero, and key-order vector. The card's legacy hashes are still not interoperable with Rust for all JSON values. Neither hash proves who published a document; verify a trusted vendor signature and bind the evidence to the buyer's authorized review before relying on it.
 
 ## Architecture
 
@@ -154,7 +159,7 @@ The draft cites fetched declarations by URL, retrieval time, and content hash. H
 │   │ fetcher.fetch_documents (async, httpx)         │       │
 │   │   - timeout 10s per doc                        │       │
 │   │   - 2 MB size cap                              │       │
-│   │   - canonical sha256 hash                      │       │
+│   │   - legacy + profiled JCS sha256 hashes       │       │
 │   │   - per-target error collection                │       │
 │   └────────────────────────────────────────────────┘       │
 │       │                                                    │
@@ -181,11 +186,12 @@ Pydantic v2 models implement the v0.1 fields and three conditional rules. They a
 
 ## Operating boundary
 
-- `API_TOKEN` is required for both POST endpoints and must contain at least 32 characters. Keep it in a secret store, rotate it through your deployment process, and send it only over TLS outside localhost. The CLI binds to `127.0.0.1` by default; the container listens inside its network namespace, so publish its port to localhost or place it behind a private, authenticated gateway.
-- `FETCH_ALLOWED_HOSTS` is a comma-separated list of exact DNS names controlled by the operator. Only HTTPS port 443, unencoded `/.well-known/*.json` paths without credentials, queries, fragments, or redirects are fetched. This is an operator trust decision. DNS rebinding and a trusted host resolving to a private address remain possible; production egress policy must block private and metadata destinations.
-- Fetched JSON is treated as untrusted data. The service does not validate a vendor declaration against its own Suite schema, verify a signature, or confirm the vendor's claims. Per-target failures are returned; the buyer must decide whether missing evidence changes the outcome.
-- `AUDIT_STREAM_URL` is optional. When enabled, the emitted event contains status and counts only; it omits buyer/vendor names and decision IDs. The operator must assess the audit destination's access, retention, and deletion policy. `/docs` and `/openapi.json` remain public metadata endpoints.
-- This package has no application-level rate limit, request-body cap, tenant authorization, or reviewer/signing workflow. The Docker base and runtime dependencies are not pinned to immutable versions. These are release gates for an internet-facing or multi-tenant deployment. Keep the service private until those controls and image provenance are verified.
+- `API_TOKEN` is required for both POST endpoints and must contain at least 32 characters. Keep it in a secret store, rotate it through your deployment process, and send it only over TLS outside localhost. The token is a shared service-use credential with no tenant, role, audience, or buyer-authority claim. The CLI binds to `127.0.0.1` by default; the container listens inside its network namespace, so publish its port to localhost or place it behind a private gateway with caller-specific authorization.
+- POST request bodies are capped at 512 KiB and must arrive within 10 s. Authenticated decision operations are limited to 60 requests per rolling minute per process, with `429` and `Retry-After` on excess. Use the gateway for distributed rate limits and unauthenticated floods.
+- `FETCH_ALLOWED_HOSTS` is a comma-separated list of exact DNS names controlled by the operator. Only HTTPS port 443, unencoded `/.well-known/*.json` paths without credentials, queries, fragments, or redirects are fetched. An initial DNS lookup rejects non-public IP answers and HTTP clients ignore proxy environment variables. DNS can change before the connection, so production egress rules must block private, loopback, link-local, and metadata destinations at the network boundary.
+- Fetched JSON is treated as untrusted data. The parser requires an object, rejects duplicate keys, and rejects values outside the RFC 8785 canonicalization domain. The service does not validate a vendor declaration against its own Suite schema, verify a signature, or confirm the vendor's claims. Per-target failures are returned; the buyer must decide whether missing evidence changes the outcome.
+- `AUDIT_STREAM_URL` is optional. When enabled, the emitted event contains status and counts only; it omits buyer/vendor names and decision IDs. This service has no persistent draft store, but clients, proxies, and the audit destination need access, retention, and deletion policies. Decision responses request `Cache-Control: no-store`; configure the gateway and clients to honor it. `/docs` and `/openapi.json` remain public metadata endpoints.
+- The Docker base is pinned by digest and its runtime dependencies are resolved from `uv.lock`. The recipe still needs a successful Linux image build and exact image-digest check in CI. No tenant authorization, verified buyer reviewer, signing workflow, or network-level egress rule is provided here. Keep the service private until those deployment controls are verified.
 
 ## Development
 

@@ -256,6 +256,15 @@ class FetchTarget(StrictModel):
     url: str
 
 
+class DocumentHash(StrictModel):
+    """Versioned, informational hash metadata outside the v0.1 Decision Card."""
+
+    type: DocumentType
+    url: str
+    hash_profile: Literal["jcs-rfc8785-v1"]
+    content_hash: str
+
+
 class DraftRequest(StrictModel):
     """
     Inputs to POST /decisions/draft.
@@ -287,8 +296,9 @@ class DraftRequest(StrictModel):
     proposed_status: DecisionStatus | None = Field(
         default=None,
         description=(
-            "If set, the service uses this. "
-            "If omitted, the draft stays pending and the rubric suggestion is returned separately."
+            "An advisory caller proposal returned as suggested_status. "
+            "The generated card remains pending even when this is set. "
+            "If omitted, suggested_status is inferred from the rubric."
         ),
     )
 
@@ -304,5 +314,6 @@ class DraftResponse(StrictModel):
 
     draft: DecisionCard
     documents_fetched: list[DocumentReference]
+    document_hashes: list[DocumentHash] = Field(default_factory=list)
     fetch_errors: list[str] = Field(default_factory=list)
     suggested_status: DecisionStatus | None = None

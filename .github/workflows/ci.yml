@@ -18,40 +18,41 @@ jobs:
       matrix:
         python: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python }}
 
-      - name: Install package + dev deps
+      - name: Install locked package + dev deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          python -m pip install uv==0.12.18
+          uv lock --check
+          uv sync --frozen --extra dev --no-editable --no-python-downloads --reinstall-package procurement-decision-api --python "$(command -v python)"
 
       - name: Lint
-        run: ruff check src tests
+        run: .venv/bin/ruff check src tests
 
       - name: Format check
-        run: ruff format --check src tests
+        run: .venv/bin/ruff format --check src tests
 
       - name: Typecheck (mypy)
-        run: mypy src
+        run: .venv/bin/mypy src
 
       - name: Tests
-        run: pytest -q
+        run: .venv/bin/pytest -q
 
   docker:
     name: Docker build smoke test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Build image
         run: docker build -t procurement-decision-api:ci .
       - name: Smoke test container
         run: |
-          docker run -d --name pda -p 8088:8088 procurement-decision-api:ci
+          docker run -d --name pda -p 127.0.0.1:8088:8088 procurement-decision-api:ci
           # Wait up to 30s for the service to come up.
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8088/healthz > /dev/null; then
@@ -62,5 +63,7 @@ jobs:
           done
           curl -fsS http://127.0.0.1:8088/healthz
           curl -fsS http://127.0.0.1:8088/ | head -c 200
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8088/decisions/draft -H 'content-type: application/json' -d '{}')"
+          test "$status" = "503"  # no API_TOKEN: decision operations fail closed
           docker logs pda | tail -20
           docker stop pda

@@ -107,7 +107,8 @@ def compose_rationale(
     parts: list[str] = []
     parts.append(
         f"Draft procurement record for {subject} with {documents_count} fetched vendor declaration(s). "
-        f"Proposed status: {status.replace('-', ' ')}{score_str}."
+        f"Advisory status suggestion: {status.replace('-', ' ')}{score_str}. "
+        "Decision status remains pending."
     )
 
     summary_pieces: list[str] = []

@@ -7,8 +7,16 @@ import asyncio
 import httpx
 import pytest
 
-from procurement_decision_api.fetcher import _canonical_hash, fetch_documents
+from procurement_decision_api.fetcher import _canonical_hash, _jcs_hash, fetch_documents
 from procurement_decision_api.models import FetchTarget
+
+
+@pytest.fixture(autouse=True)
+def mock_public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def resolve(_host: str) -> list[str]:
+        return ["1.1.1.1"]
+
+    monkeypatch.setattr("procurement_decision_api.fetcher._resolve_host_addresses", resolve)
 
 
 class _OversizeStream(httpx.AsyncByteStream):
@@ -55,6 +63,47 @@ async def test_query_parameter_is_rejected_before_network(monkeypatch: pytest.Mo
                 [FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json?token=secret")],
                 client=client,
             )
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_private_dns_answer_rejected_before_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
+
+    async def private_dns(_host: str) -> list[str]:
+        return ["1.1.1.1", "169.254.169.254"]
+
+    monkeypatch.setattr("procurement_decision_api.fetcher._resolve_host_addresses", private_dns)
+    requests: list[httpx.Request] = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: requests.append(r) or httpx.Response(200))
+    ) as client:
+        with pytest.raises(ValueError, match="public IP"):
+            await fetch_documents(
+                [FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json")],
+                client=client,
+            )
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_unavailable_dns_is_per_target_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
+
+    async def unavailable(_host: str) -> list[str]:
+        raise OSError("test-only DNS failure")
+
+    monkeypatch.setattr("procurement_decision_api.fetcher._resolve_host_addresses", unavailable)
+    requests: list[httpx.Request] = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: requests.append(r) or httpx.Response(200))
+    ) as client:
+        docs, errors = await fetch_documents(
+            [FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json")],
+            client=client,
+        )
+    assert docs == []
+    assert errors == ["https://vendor.example/.well-known/aeo.json: DNS resolution failed"]
     assert requests == []
 
 
@@ -112,6 +161,56 @@ async def test_non_json_number_rejected(monkeypatch: pytest.MonkeyPatch) -> None
         )
     assert docs == []
     assert "invalid JSON" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_json_key_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=b'{"name":1,"name":2}'))
+    async with httpx.AsyncClient(transport=transport) as client:
+        docs, errors = await fetch_documents(
+            [FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json")], client=client
+        )
+    assert docs == []
+    assert "duplicate JSON object key" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_out_of_jcs_number_domain_is_per_target_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, content=b'{"large":9007199254740992}')
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        docs, errors = await fetch_documents(
+            [FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json")], client=client
+        )
+    assert docs == []
+    assert "outside the RFC 8785 domain" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_scalar_json_is_not_a_vendor_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=b"null"))
+    async with httpx.AsyncClient(transport=transport) as client:
+        docs, errors = await fetch_documents(
+            [FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json")], client=client
+        )
+    assert docs == []
+    assert "must be a JSON object" in errors[0]
+
+
+def test_jcs_hash_matches_rust_cross_language_vector() -> None:
+    document = {
+        "name": "Café",
+        "x": 1e-7,
+        "negzero": -0.0,
+        "דּ": "Hebrew",
+        "😀": "Emoji",
+        "nested": {"b": 2, "a": 1},
+    }
+    assert _jcs_hash(document) == ("sha256:2ec69677ffa05c1cb85954219ca2065693bd7b7d0f028ff4fbbc1974baac61a8")
 
 
 @pytest.mark.xfail(

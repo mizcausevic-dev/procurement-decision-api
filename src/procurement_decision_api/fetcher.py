@@ -16,15 +16,20 @@ import ipaddress
 import json
 import os
 import re
+import socket
 from datetime import UTC, datetime
+from typing import Any, Literal, cast
 
 import httpx
+import rfc8785
 
 from . import __version__
-from .models import DocumentReference, FetchTarget
+from .models import DocumentHash, DocumentReference, FetchTarget
 
 DEFAULT_TIMEOUT_S = 10.0
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024  # 2 MB — well-known docs should never exceed this
+DNS_TIMEOUT_S = 3.0
+JCS_HASH_PROFILE: Literal["jcs-rfc8785-v1"] = "jcs-rfc8785-v1"
 _HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 _PATH_RE = re.compile(rb"^/\.well-known/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\.json$")
 
@@ -75,19 +80,58 @@ def _check_targets(targets: list[FetchTarget]) -> None:
             )
 
 
+async def _resolve_host_addresses(host: str) -> list[str]:
+    """Resolve all A/AAAA answers; kept separate so tests need no real DNS."""
+    answers = await asyncio.get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    return [str(answer[4][0]) for answer in answers]
+
+
+async def _check_public_dns(targets: list[FetchTarget]) -> dict[str, str]:
+    """Reject non-public answers and collect unavailable DNS as per-target errors."""
+    hosts = {httpx.URL(target.url).host for target in targets}
+
+    async def check(host: str | None) -> tuple[str, str | None]:
+        if host is None:
+            raise ValueError("Fetch target hostname is missing")
+        try:
+            addresses = await asyncio.wait_for(_resolve_host_addresses(host), timeout=DNS_TIMEOUT_S)
+        except (OSError, TimeoutError):
+            return host, "DNS resolution failed"
+        if not addresses or any(not ipaddress.ip_address(value).is_global for value in addresses):
+            raise ValueError("Fetch target DNS must resolve only to public IP addresses")
+        return host, None
+
+    return {host: error for host, error in await asyncio.gather(*(check(host) for host in hosts)) if error}
+
+
 class FetchedDocument:
     """Internal carrier for a fetched document reference."""
 
-    __slots__ = ("reference",)
+    __slots__ = ("document_hash", "reference")
 
-    def __init__(self, reference: DocumentReference) -> None:
+    def __init__(self, reference: DocumentReference, document_hash: DocumentHash) -> None:
         self.reference = reference
+        self.document_hash = document_hash
 
 
 def _canonical_hash(parsed: object) -> str:
     """Return `sha256:<hex>` over canonical JSON bytes (sorted keys, no whitespace)."""
     canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _jcs_hash(parsed: object) -> str:
+    """Return the versioned RFC 8785 digest used by the Rust attestation tool."""
+    return "sha256:" + hashlib.sha256(rfc8785.dumps(cast(Any, parsed))).hexdigest()
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
 
 
 def _reject_non_json_number(value: str) -> None:
@@ -127,9 +171,17 @@ async def _fetch_one(
             parsed = json.loads(
                 body_bytes.decode("utf-8"),
                 parse_constant=_reject_non_json_number,
+                object_pairs_hook=_unique_json_object,
             )
         except (UnicodeDecodeError, ValueError, RecursionError) as err:
             return None, f"{target.url}: invalid JSON ({err})"
+        if not isinstance(parsed, dict):
+            return None, f"{target.url}: vendor document must be a JSON object"
+
+        try:
+            jcs_hash = _jcs_hash(parsed)
+        except rfc8785.CanonicalizationError as err:
+            return None, f"{target.url}: JSON is outside the RFC 8785 domain ({type(err).__name__})"
 
         reference = DocumentReference(
             type=target.type,
@@ -137,7 +189,13 @@ async def _fetch_one(
             fetched_at=datetime.now(UTC).isoformat(timespec="seconds"),
             content_hash=_canonical_hash(parsed),
         )
-        return FetchedDocument(reference), None
+        document_hash = DocumentHash(
+            type=target.type,
+            url=target.url,
+            hash_profile=JCS_HASH_PROFILE,
+            content_hash=jcs_hash,
+        )
+        return FetchedDocument(reference, document_hash), None
 
     except httpx.TimeoutException:
         return None, f"{target.url}: timeout"
@@ -173,19 +231,26 @@ async def fetch_documents(
         return [], []
 
     _check_targets(targets)
+    dns_errors = await _check_public_dns(targets)
 
     own_client = client is None
     if client is None:
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_s),
             follow_redirects=False,
+            trust_env=False,
             headers={"User-Agent": f"procurement-decision-api/{__version__} (+https://kineticgain.com)"},
         )
 
     try:
-        results = await asyncio.gather(
-            *(_fetch_limited(client, t, timeout_s=timeout_s, max_bytes=max_bytes) for t in targets)
-        )
+
+        async def run(target: FetchTarget) -> tuple[FetchedDocument | None, str | None]:
+            host = httpx.URL(target.url).host
+            if host is not None and host in dns_errors:
+                return None, f"{target.url}: {dns_errors[host]}"
+            return await _fetch_limited(client, target, timeout_s=timeout_s, max_bytes=max_bytes)
+
+        results = await asyncio.gather(*(run(target) for target in targets))
     finally:
         if own_client:
             await client.aclose()
