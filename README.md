@@ -26,7 +26,7 @@ Agent Card                  │        fetched documents / rationale)
 
 ## Quick start
 
-From this checkout, use the unreleased v0.2.0 code. The PyPI v0.1.1 package has the earlier API behavior.
+From this checkout, use the v0.2.0 code. The published v0.1.1 package has the earlier API behavior.
 
 ```bash
 python -m pip install -e .
@@ -110,7 +110,7 @@ The response includes:
 
 ### v0.2.0 status and hash migration
 
-The unreleased v0.2.0 API always emits `draft.decision.status=pending`, even when `proposed_status` is `approved`, `rejected`, or another nonpending value. That value appears only in `suggested_status`. Callers of v0.1.1 that treated the generated card as an approved or rejected decision must add a separate buyer review and signing workflow. The validation endpoint now returns `structure_valid` and `claimed_status` instead of `valid` and `status`; it omits buyer/vendor identity and reports `authority_verified:false` and `signatures_verified:false`. `documents_fetched[].content_hash` and `draft.subject.documents_reviewed[].content_hash` keep the v0.1.1 Python algorithm for schema compatibility. Use the profiled `document_hashes[]` only as informational comparison data. The upstream v0.1 card schema has no hash-profile field, and this service does not verify vendor signatures or sign its response.
+In v0.2.0, the API always emits `draft.decision.status=pending`, even when `proposed_status` is `approved`, `rejected`, or another nonpending value. That value appears only in `suggested_status`. Callers of v0.1.1 that treated the generated card as an approved or rejected decision must add a separate buyer review and signing workflow. The validation endpoint now returns `structure_valid` and `claimed_status` instead of `valid` and `status`; it omits buyer/vendor identity and reports `authority_verified:false` and `signatures_verified:false`. `documents_fetched[].content_hash` and `draft.subject.documents_reviewed[].content_hash` keep the v0.1.1 Python algorithm for schema compatibility. Use the profiled `document_hashes[]` only as informational comparison data. The upstream v0.1 card schema has no hash-profile field, and this service does not verify vendor signatures or sign its response.
 
 ## What the service does
 
