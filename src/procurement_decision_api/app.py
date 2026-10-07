@@ -4,7 +4,7 @@ FastAPI app — three endpoints.
   GET  /                  service info
   GET  /healthz           liveness probe
   POST /decisions/draft   produce a Draft Decision Card
-  POST /decisions/validate validate an existing Decision Card
+  POST /decisions/validate check the v0.1 shape of an existing Decision Card
 
 Run locally:
   uvicorn procurement_decision_api.app:app --reload --port 8088
@@ -14,17 +14,22 @@ Or via the supplied Docker image.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from hmac import compare_digest
+from typing import Annotated, Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
+from starlette.responses import JSONResponse
 
 from . import __version__, audit_stream
 from .drafter import DraftError, draft_decision_card
 from .fetcher import DEFAULT_TIMEOUT_S, fetch_documents
+from .limits import RequestBodyLimit, SlidingWindowLimiter
 from .models import DecisionCard, DraftRequest, DraftResponse
 
 
@@ -33,7 +38,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Hold a single shared httpx.AsyncClient for the lifetime of the app."""
     app.state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(DEFAULT_TIMEOUT_S),
-        follow_redirects=True,
+        follow_redirects=False,
+        trust_env=False,
         headers={"User-Agent": f"procurement-decision-api/{__version__} (+https://kineticgain.com)"},
     )
     try:
@@ -51,6 +57,39 @@ app = FastAPI(
     ),
     lifespan=_lifespan,
 )
+app.add_middleware(RequestBodyLimit)
+app.state.rate_limiter = SlidingWindowLimiter()
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error(_request: Any, err: RequestValidationError) -> JSONResponse:
+    """Keep buyer/vendor input values out of automatic validation responses."""
+    errors = [
+        {key: value for key, value in item.items() if key not in {"input", "ctx", "url"}}
+        for item in err.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
+async def _require_api_token(authorization: Annotated[str | None, Header()] = None) -> None:
+    """Deny decision operations until the operator configures a bearer token."""
+    expected = os.environ.get("API_TOKEN", "")
+    if len(expected) < 32:
+        raise HTTPException(
+            status_code=503, detail="API_TOKEN must be configured with at least 32 characters"
+        )
+    scheme, _, supplied = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=401, detail="Valid bearer token required", headers={"WWW-Authenticate": "Bearer"}
+        )
+    retry_after: int = app.state.rate_limiter.admit()
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="Authenticated request rate limit exceeded",
+            headers={"Retry-After": str(retry_after)},
+        )
 
 
 @app.get("/", tags=["meta"])
@@ -70,7 +109,7 @@ async def root() -> dict[str, Any]:
             "GET  /": "this page",
             "GET  /healthz": "liveness probe",
             "POST /decisions/draft": "produce a Draft Decision Card",
-            "POST /decisions/validate": "validate an existing Decision Card",
+            "POST /decisions/validate": "check the v0.1 card structure only",
             "GET  /openapi.json": "machine-readable API schema",
             "GET  /docs": "interactive API documentation",
         },
@@ -86,8 +125,11 @@ async def healthz() -> dict[str, str]:
     "/decisions/draft",
     response_model=DraftResponse,
     tags=["decisions"],
+    dependencies=[Depends(_require_api_token)],
     responses={
-        400: {"description": "Draft inputs are invalid (e.g. status requires conditions)."},
+        400: {"description": "Draft inputs or fetch targets are invalid."},
+        413: {"description": "Request body exceeds 512 KiB."},
+        429: {"description": "Authenticated request rate limit exceeded."},
     },
 )
 async def draft(request: DraftRequest) -> DraftResponse:
@@ -97,7 +139,7 @@ async def draft(request: DraftRequest) -> DraftResponse:
     Pipeline:
 
       1. Fetch every URL in `fetch_targets` (concurrently, with hash + timestamp).
-      2. Infer `decision.status` from the rubric (unless `proposed_status` is given).
+      2. Keep `decision.status` pending and return a proposed/rubric status separately.
       3. Compose a rationale (unless `rationale_template` is given).
       4. Assemble + validate the Decision Card.
 
@@ -105,10 +147,13 @@ async def draft(request: DraftRequest) -> DraftResponse:
     and any per-target fetch errors.
     """
     http_client: httpx.AsyncClient = app.state.http_client
-    fetched, errors = await fetch_documents(request.fetch_targets, client=http_client)
+    try:
+        fetched, errors = await fetch_documents(request.fetch_targets, client=http_client)
+    except ValueError as err:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err)) from err
 
     try:
-        card, inferred = draft_decision_card(request, fetched_documents=fetched)
+        card, suggested = draft_decision_card(request, fetched_documents=fetched)
     except DraftError as err:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err)) from err
 
@@ -118,36 +163,37 @@ async def draft(request: DraftRequest) -> DraftResponse:
         http_client,
         kind="decision_card_drafted",
         payload={
-            "decision_id": card.decision_id,
-            "vendor": card.subject.vendor_name,
             "status": card.decision.status,
-            "buyer": card.buyer.name,
             "documents_fetched": len(fetched),
             "fetch_errors": len(errors),
-            "inferred_status": inferred,
         },
     )
 
     return DraftResponse(
         draft=card,
         documents_fetched=[d.reference for d in fetched],
+        document_hashes=[d.document_hash for d in fetched],
         fetch_errors=errors,
-        inferred_status=inferred,
+        suggested_status=suggested,
     )
 
 
 @app.post(
     "/decisions/validate",
     tags=["decisions"],
+    dependencies=[Depends(_require_api_token)],
     responses={
-        200: {"description": "Card is valid."},
-        422: {"description": "Card failed schema validation."},
+        200: {"description": "Card passes this service's local v0.1 structural checks only."},
+        422: {"description": "Card failed validation against this service's v0.1 model."},
+        413: {"description": "Request body exceeds 512 KiB."},
+        429: {"description": "Authenticated request rate limit exceeded."},
     },
 )
 async def validate_card(payload: dict[str, Any]) -> dict[str, Any]:
     """
-    Validate an existing Decision Card against the v0.1 schema (including
-    conditional rules). Returns a summary on success; raises 422 on failure.
+    Check an existing Decision Card against this service's v0.1 model and
+    selected conditional rules. This does not verify buyer authority, vendor
+    declarations, or signatures. Returns a minimal summary or raises 422.
     """
     try:
         card = DecisionCard.model_validate(payload)
@@ -157,20 +203,18 @@ async def validate_card(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
-                "valid": False,
-                "errors": err.errors(include_url=False, include_context=False),
+                "structure_valid": False,
+                "schema_scope": "local-decision-card-v0.1",
+                "errors": err.errors(include_url=False, include_context=False, include_input=False),
             },
         ) from err
 
     return {
-        "valid": True,
-        "decision_id": card.decision_id,
-        "status": card.decision.status,
-        "buyer": card.buyer.name,
-        "buyer_type": card.buyer.type,
-        "vendor": card.subject.vendor_name,
-        "product": card.subject.product_name,
-        "documents_reviewed": len(card.subject.documents_reviewed or []),
+        "structure_valid": True,
+        "schema_scope": "local-decision-card-v0.1",
+        "claimed_status": card.decision.status,
+        "authority_verified": False,
+        "signatures_verified": False,
+        "documents_referenced": len(card.subject.documents_reviewed or []),
         "conditions_count": len(card.conditions or []),
-        "is_public": (card.publication.is_public if card.publication else False) or False,
     }

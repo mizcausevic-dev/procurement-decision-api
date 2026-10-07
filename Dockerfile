@@ -1,4 +1,4 @@
-FROM python:3.13-slim AS base
+FROM python:3.13-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641 AS base
 
 # System hardening
 RUN useradd -m -u 10001 app \
@@ -11,23 +11,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# --- builder stage installs into a venv we copy into the final image ---
+# --- builder stage installs locked runtime packages into a venv ---
 FROM base AS builder
 
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
-
-COPY pyproject.toml README.md ./
+RUN python -m pip install --no-cache-dir uv==0.12.18
+COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/
 
-# Install the package + runtime deps only (no dev deps).
-RUN pip install --upgrade pip && pip install .
+# The universal lock records package versions and artifact hashes.
+RUN uv sync --frozen --no-dev --no-editable --no-python-downloads --reinstall-package procurement-decision-api
 
 # --- runtime stage: minimal surface ---
 FROM base AS runtime
 
-ENV PATH="/opt/venv/bin:${PATH}"
-COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/app/.venv/bin:${PATH}"
+COPY --from=builder /app/.venv /app/.venv
 
 USER app
 EXPOSE 8088

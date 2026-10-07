@@ -3,10 +3,9 @@ Assemble a Draft Decision Card from a DraftRequest + fetched documents.
 
 This is the heart of the service. Order of operations:
 
-  1. Compute documents_reviewed[] from the fetched documents (URL, hash, time).
-  2. Decide on a status (caller-supplied or inferred from rubric).
-  3. If status requires conditions and the caller supplied none, raise a
-     400-equivalent error (the caller should review the rubric and fill them in).
+  1. Keep fetched document metadata outside the Decision Card until reviewed.
+  2. Keep the draft pending and return a proposed or rubric status separately.
+  3. Keep caller conditions for a later authorized review.
   4. Compose a rationale (caller-supplied or generated).
   5. Pack the Decision Card and run Pydantic validation — including the
      superRefine-equivalent rules in the model.
@@ -22,9 +21,8 @@ from .models import (
     Decision,
     DecisionCard,
     DecisionMaker,
-    DocumentReference,
+    DecisionStatus,
     DraftRequest,
-    HistoryEvent,
     Publication,
     Subject,
 )
@@ -39,36 +37,27 @@ def draft_decision_card(
     req: DraftRequest,
     *,
     fetched_documents: list[FetchedDocument],
-) -> tuple[DecisionCard, bool]:
+) -> tuple[DecisionCard, DecisionStatus | None]:
     """
     Build a Decision Card from the request + fetched docs.
 
     Returns:
-      (card, inferred_status_used)
-        card                 — the validated DecisionCard instance
-        inferred_status_used — True if we inferred status (caller didn't supply)
+      (card, suggested_status)
+        card             — the validated DecisionCard instance
+        suggested_status — advisory result, never an authorization
     """
     now_iso = datetime.now(UTC).isoformat(timespec="seconds")
 
-    # 1. documents_reviewed from fetched + any URLs the caller already pre-staged
-    docs_reviewed: list[DocumentReference] = [d.reference for d in fetched_documents]
+    # 1. Fetching a document is not a buyer review. The API returns fetched
+    # metadata separately; a later authorized review may populate this field.
 
-    # 2. status: caller wins, otherwise infer
-    inferred = False
-    if req.proposed_status is not None:
-        status = req.proposed_status
-    else:
-        status = infer_status(req.rubric)
-        inferred = True
+    # 2. A rubric suggestion is advisory; never turn it into an approval.
+    suggested: DecisionStatus | None = None
+    status: DecisionStatus = "pending"
+    suggested = req.proposed_status if req.proposed_status is not None else infer_status(req.rubric)
 
-    # 3. conditions check
-    if status in ("approved-with-conditions", "rejected-with-remediation"):
-        if not req.conditions:
-            raise DraftError(
-                f"decision.status={status} requires conditions, "
-                "but the request did not supply any. Either provide conditions "
-                "or change proposed_status / rubric so a different status is inferred."
-            )
+    if req.publication and req.publication.is_public is True:
+        raise DraftError("A draft cannot claim publication.is_public=true; publish only after buyer review")
 
     # 4. rationale
     if req.rationale_template:
@@ -76,10 +65,10 @@ def draft_decision_card(
     else:
         rationale = compose_rationale(
             req.rubric,
-            status=status,
+            status=suggested,
             vendor_name=req.vendor_name,
             product_name=req.product_name,
-            documents_count=len(docs_reviewed),
+            documents_count=len(fetched_documents),
         )
 
     # 5. assemble
@@ -94,7 +83,7 @@ def draft_decision_card(
         vendor_name=req.vendor_name,
         product_name=req.product_name,
         vendor_id=req.vendor_id,
-        documents_reviewed=docs_reviewed if docs_reviewed else None,
+        documents_reviewed=None,
     )
 
     criteria: Criteria | None = None
@@ -103,18 +92,6 @@ def draft_decision_card(
             policy_uris=req.policy_uris,
             rubric=req.rubric if req.rubric else None,
         )
-
-    history = [
-        HistoryEvent(event="review_started", at=now_iso, actor="procurement-decision-api"),
-        HistoryEvent(event="documents_collected", at=now_iso, actor="procurement-decision-api"),
-        HistoryEvent(event="review_completed", at=now_iso, actor="procurement-decision-api"),
-        HistoryEvent(
-            event=status if status in _HISTORY_STATUS_EVENTS else "review_completed",
-            at=now_iso,
-            actor="procurement-decision-api",
-            note="Draft produced by procurement-decision-api; review before signing.",
-        ),
-    ]
 
     publication: Publication | None = req.publication
 
@@ -131,19 +108,6 @@ def draft_decision_card(
         criteria=criteria,
         conditions=req.conditions,
         rationale=rationale,
-        history=history,
         publication=publication,
     )
-    return card, inferred
-
-
-# History event names that match DecisionStatus values 1:1.
-_HISTORY_STATUS_EVENTS = {
-    "approved",
-    "approved-with-conditions",
-    "rejected",
-    "rejected-with-remediation",
-    "pending",
-    "withdrawn",
-    "expired",
-}
+    return card, suggested
