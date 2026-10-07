@@ -126,6 +126,7 @@ class TestDraft:
         assert body["draft"]["decision"]["status"] == "pending"
         assert body["suggested_status"] == "approved"
         assert body["draft"]["history"] is None
+        assert body["draft"]["subject"]["documents_reviewed"] is None
         assert len(body["documents_fetched"]) == 1
         assert body["documents_fetched"][0]["type"] == "aeo"
         assert body["documents_fetched"][0]["content_hash"].startswith("sha256:")

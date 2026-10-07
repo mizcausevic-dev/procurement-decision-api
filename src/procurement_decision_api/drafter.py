@@ -3,7 +3,7 @@ Assemble a Draft Decision Card from a DraftRequest + fetched documents.
 
 This is the heart of the service. Order of operations:
 
-  1. Compute documents_reviewed[] from the fetched documents (URL, hash, time).
+  1. Keep fetched document metadata outside the Decision Card until reviewed.
   2. Keep the draft pending and return a proposed or rubric status separately.
   3. Keep caller conditions for a later authorized review.
   4. Compose a rationale (caller-supplied or generated).
@@ -22,7 +22,6 @@ from .models import (
     DecisionCard,
     DecisionMaker,
     DecisionStatus,
-    DocumentReference,
     DraftRequest,
     Publication,
     Subject,
@@ -49,8 +48,8 @@ def draft_decision_card(
     """
     now_iso = datetime.now(UTC).isoformat(timespec="seconds")
 
-    # 1. The schema calls these documents_reviewed; this service only fetched them.
-    docs_reviewed: list[DocumentReference] = [d.reference for d in fetched_documents]
+    # 1. Fetching a document is not a buyer review. The API returns fetched
+    # metadata separately; a later authorized review may populate this field.
 
     # 2. A rubric suggestion is advisory; never turn it into an approval.
     suggested: DecisionStatus | None = None
@@ -69,7 +68,7 @@ def draft_decision_card(
             status=suggested,
             vendor_name=req.vendor_name,
             product_name=req.product_name,
-            documents_count=len(docs_reviewed),
+            documents_count=len(fetched_documents),
         )
 
     # 5. assemble
@@ -84,7 +83,7 @@ def draft_decision_card(
         vendor_name=req.vendor_name,
         product_name=req.product_name,
         vendor_id=req.vendor_id,
-        documents_reviewed=docs_reviewed if docs_reviewed else None,
+        documents_reviewed=None,
     )
 
     criteria: Criteria | None = None

@@ -3,7 +3,8 @@ Vendor document fetcher.
 
 Fetches each FetchTarget URL with httpx, computes a sha256 content_hash over the
 canonicalised JSON (sorted keys, no whitespace), and returns DocumentReference
-records suitable for inclusion in the Decision Card's subject.documents_reviewed.
+records for the API's documents_fetched response. Fetching alone does not
+constitute review of a Decision Card's subject.documents_reviewed field.
 
 Errors are collected per-document; one failed fetch doesn't fail the whole draft.
 """
