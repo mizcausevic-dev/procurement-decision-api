@@ -42,6 +42,12 @@ class TestConfig:
         monkeypatch.setenv("AUDIT_STREAM_TIMEOUT_S", "not-a-number")
         assert audit_stream.timeout_s() == audit_stream.DEFAULT_TIMEOUT_S
 
+    def test_timeout_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_TIMEOUT_S", "infinity")
+        assert audit_stream.timeout_s() == audit_stream.DEFAULT_TIMEOUT_S
+        monkeypatch.setenv("AUDIT_STREAM_TIMEOUT_S", "600")
+        assert audit_stream.timeout_s() == 10.0
+
 
 class TestEmit:
     @pytest.mark.asyncio
@@ -97,10 +103,9 @@ class TestEmit:
         async with httpx.AsyncClient(transport=transport) as client:
             # Must not raise.
             await audit_stream.emit(client, kind="decision_card_drafted", payload={})
-        out = capsys.readouterr().out + capsys.readouterr().err
-        # Some error message was logged; specific text isn't asserted to keep
-        # the test resilient to format tweaks.
-        assert "audit-stream emit failed" in out or True  # log captured loosely
+        captured = capsys.readouterr()
+        assert "audit-stream emit failed" in captured.err
+        assert "http://audit.local" not in captured.err
 
     @pytest.mark.asyncio
     async def test_emit_swallows_connection_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -14,12 +14,14 @@ Or via the supplied Docker image.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from hmac import compare_digest
+from typing import Annotated, Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import ValidationError
 
 from . import __version__, audit_stream
@@ -33,7 +35,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Hold a single shared httpx.AsyncClient for the lifetime of the app."""
     app.state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(DEFAULT_TIMEOUT_S),
-        follow_redirects=True,
+        follow_redirects=False,
         headers={"User-Agent": f"procurement-decision-api/{__version__} (+https://kineticgain.com)"},
     )
     try:
@@ -51,6 +53,20 @@ app = FastAPI(
     ),
     lifespan=_lifespan,
 )
+
+
+async def _require_api_token(authorization: Annotated[str | None, Header()] = None) -> None:
+    """Deny decision operations until the operator configures a bearer token."""
+    expected = os.environ.get("API_TOKEN", "")
+    if len(expected) < 32:
+        raise HTTPException(
+            status_code=503, detail="API_TOKEN must be configured with at least 32 characters"
+        )
+    scheme, _, supplied = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=401, detail="Valid bearer token required", headers={"WWW-Authenticate": "Bearer"}
+        )
 
 
 @app.get("/", tags=["meta"])
@@ -86,6 +102,7 @@ async def healthz() -> dict[str, str]:
     "/decisions/draft",
     response_model=DraftResponse,
     tags=["decisions"],
+    dependencies=[Depends(_require_api_token)],
     responses={
         400: {"description": "Draft inputs are invalid (e.g. status requires conditions)."},
     },
@@ -105,10 +122,13 @@ async def draft(request: DraftRequest) -> DraftResponse:
     and any per-target fetch errors.
     """
     http_client: httpx.AsyncClient = app.state.http_client
-    fetched, errors = await fetch_documents(request.fetch_targets, client=http_client)
+    try:
+        fetched, errors = await fetch_documents(request.fetch_targets, client=http_client)
+    except ValueError as err:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err)) from err
 
     try:
-        card, inferred = draft_decision_card(request, fetched_documents=fetched)
+        card, suggested = draft_decision_card(request, fetched_documents=fetched)
     except DraftError as err:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err)) from err
 
@@ -118,13 +138,9 @@ async def draft(request: DraftRequest) -> DraftResponse:
         http_client,
         kind="decision_card_drafted",
         payload={
-            "decision_id": card.decision_id,
-            "vendor": card.subject.vendor_name,
             "status": card.decision.status,
-            "buyer": card.buyer.name,
             "documents_fetched": len(fetched),
             "fetch_errors": len(errors),
-            "inferred_status": inferred,
         },
     )
 
@@ -132,22 +148,23 @@ async def draft(request: DraftRequest) -> DraftResponse:
         draft=card,
         documents_fetched=[d.reference for d in fetched],
         fetch_errors=errors,
-        inferred_status=inferred,
+        suggested_status=suggested,
     )
 
 
 @app.post(
     "/decisions/validate",
     tags=["decisions"],
+    dependencies=[Depends(_require_api_token)],
     responses={
         200: {"description": "Card is valid."},
-        422: {"description": "Card failed schema validation."},
+        422: {"description": "Card failed validation against this service's v0.1 model."},
     },
 )
 async def validate_card(payload: dict[str, Any]) -> dict[str, Any]:
     """
-    Validate an existing Decision Card against the v0.1 schema (including
-    conditional rules). Returns a summary on success; raises 422 on failure.
+    Validate an existing Decision Card against this service's v0.1 model and
+    selected conditional rules. Returns a summary on success; raises 422 on failure.
     """
     try:
         card = DecisionCard.model_validate(payload)

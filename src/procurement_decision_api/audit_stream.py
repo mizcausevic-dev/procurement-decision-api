@@ -7,13 +7,14 @@ service produces. Best-effort: a failed POST is logged, not raised —
 audit-stream outages must never block decision drafting.
 
 Set `AUDIT_STREAM_URL=` (empty) or unset to disable. Set
-`AUDIT_STREAM_TIMEOUT_S=2.5` to override the default fire-and-forget
-timeout.
+`AUDIT_STREAM_TIMEOUT_S=2.5` to override the default bounded call timeout.
 """
 
 from __future__ import annotations
 
 import os
+import sys
+from math import isfinite
 from typing import Any
 
 import httpx
@@ -40,7 +41,8 @@ def timeout_s() -> float:
     if not raw:
         return DEFAULT_TIMEOUT_S
     try:
-        return max(0.1, float(raw))
+        value = float(raw)
+        return min(10.0, max(0.1, value)) if isfinite(value) else DEFAULT_TIMEOUT_S
     except ValueError:
         return DEFAULT_TIMEOUT_S
 
@@ -75,7 +77,5 @@ async def emit(
         response.raise_for_status()
     except (httpx.HTTPError, OSError) as err:
         # Best-effort. Print but don't raise.
-        print(
-            f"audit-stream emit failed (kind={kind}): {type(err).__name__}: {err}",
-            flush=True,
-        )
+        # Exception messages may contain a configured URL with credentials.
+        print(f"audit-stream emit failed (kind={kind}): {type(err).__name__}", file=sys.stderr, flush=True)

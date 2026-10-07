@@ -1,12 +1,11 @@
 """
-Pydantic v2 models mirroring the AI Procurement Decision Card v0.1 schema.
+Pydantic v2 models for the AI Procurement Decision Card v0.1 fields.
 
 Source of truth: https://github.com/mizcausevic-dev/ai-procurement-decision-spec
 Schema:         decision-card.schema.json (JSON Schema 2020-12)
 
-The conditional rules in the upstream schema's superRefine block are mirrored
-here as model_validator checks so the API rejects ill-formed cards at the
-same point the npm/zod validator would.
+Three conditional rules are implemented with model_validator checks. This is
+not a complete validator for current upstream schema versions.
 """
 
 from __future__ import annotations
@@ -16,8 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ---------------------------------------------------------------------------
-# Enumerations — match the JSON Schema exactly so Decision Cards produced
-# here validate identically against kg-validate-action and the hosted validator.
+# Enumerations for the v0.1 card fields. Cross-validator parity is unverified.
 # ---------------------------------------------------------------------------
 
 BuyerType = Literal[
@@ -274,10 +272,10 @@ class DraftRequest(StrictModel):
     vendor_name: str = Field(..., min_length=1)
     product_name: str | None = None
     vendor_id: str | None = None
-    fetch_targets: list[FetchTarget] = Field(default_factory=list)
+    fetch_targets: list[FetchTarget] = Field(default_factory=list, max_length=16)
 
     policy_uris: list[str] | None = None
-    rubric: list[RubricCriterion]
+    rubric: list[RubricCriterion] = Field(max_length=200)
     rationale_template: str | None = Field(
         default=None,
         description=(
@@ -290,9 +288,7 @@ class DraftRequest(StrictModel):
         default=None,
         description=(
             "If set, the service uses this. "
-            "If omitted, the service infers from rubric results: any fail -> rejected; "
-            "any partial / pass-with-condition -> approved-with-conditions; "
-            "all pass -> approved."
+            "If omitted, the draft stays pending and the rubric suggestion is returned separately."
         ),
     )
 
@@ -309,4 +305,4 @@ class DraftResponse(StrictModel):
     draft: DecisionCard
     documents_fetched: list[DocumentReference]
     fetch_errors: list[str] = Field(default_factory=list)
-    inferred_status: bool = False
+    suggested_status: DecisionStatus | None = None

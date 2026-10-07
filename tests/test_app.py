@@ -37,6 +37,7 @@ SAMPLE_TOOL_CARD_DOC = {
     "name": "lookup_homework",
     "description": "Look up the assigned homework for a student",
 }
+TEST_API_TOKEN = "test-only-api-token-32-characters-minimum"
 
 
 def _vendor_router(request: httpx.Request) -> httpx.Response:
@@ -52,24 +53,28 @@ def _vendor_router(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200, content=b"this is not JSON {", headers={"content-type": "application/json"}
         )
+    if url.endswith("/.well-known/redirect.json"):
+        return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
     return httpx.Response(404)
 
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """TestClient that intercepts HTTP calls to the mocked vendor."""
+    monkeypatch.setenv("API_TOKEN", TEST_API_TOKEN)
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "acmetutor.example")
     transport = httpx.MockTransport(_vendor_router)
     # Capture the real AsyncClient class BEFORE we patch the symbol; otherwise
     # the factory would call its own patched self and recurse infinitely.
     real_async_client = httpx.AsyncClient
 
     def _install_mock_client(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
-        return real_async_client(transport=transport, follow_redirects=True)
+        return real_async_client(transport=transport, follow_redirects=False)
 
     # Replace the lifespan's client construction. Lifespan runs on first request.
     monkeypatch.setattr(app_module.httpx, "AsyncClient", _install_mock_client)
 
-    with TestClient(app) as c:
+    with TestClient(app, headers={"Authorization": f"Bearer {TEST_API_TOKEN}"}) as c:
         yield c
 
 
@@ -110,16 +115,18 @@ class TestDraft:
         assert r.status_code == 200, r.json()
         body = r.json()
         assert body["draft"]["decision_id"] == "TEST-DEC-001"
-        assert body["draft"]["decision"]["status"] == "approved"
+        assert body["draft"]["decision"]["status"] == "pending"
+        assert body["suggested_status"] == "approved"
+        assert body["draft"]["history"] is None
         assert len(body["documents_fetched"]) == 1
         assert body["documents_fetched"][0]["type"] == "aeo"
         assert body["documents_fetched"][0]["content_hash"].startswith("sha256:")
         assert body["fetch_errors"] == []
-        assert body["inferred_status"] is True
 
     def test_fail_criterion_requires_conditions(self, client: TestClient) -> None:
         """When inference yields rejected-with-remediation, the request must supply conditions."""
         req = self._base_request(
+            proposed_status="rejected-with-remediation",
             rubric=[
                 {"id": "ferpa", "result": "fail", "weight": 1.0, "notes": "No DPA"},
             ],
@@ -130,6 +137,7 @@ class TestDraft:
 
     def test_fail_criterion_with_conditions_works(self, client: TestClient) -> None:
         req = self._base_request(
+            proposed_status="rejected-with-remediation",
             rubric=[{"id": "ferpa", "result": "fail", "weight": 1.0, "notes": "No DPA"}],
             conditions=[{"id": "dpa-remediation", "description": "Sign DPA before re-review."}],
         )
@@ -147,7 +155,8 @@ class TestDraft:
         )
         r = client.post("/decisions/draft", json=req)
         assert r.status_code == 200
-        assert r.json()["draft"]["decision"]["status"] == "approved-with-conditions"
+        assert r.json()["draft"]["decision"]["status"] == "pending"
+        assert r.json()["suggested_status"] == "approved-with-conditions"
 
     def test_proposed_status_overrides_inference(self, client: TestClient) -> None:
         req = self._base_request(
@@ -158,7 +167,7 @@ class TestDraft:
         assert r.status_code == 200
         body = r.json()
         assert body["draft"]["decision"]["status"] == "pending"
-        assert body["inferred_status"] is False
+        assert body["suggested_status"] is None
 
     def test_fetch_errors_dont_fail_the_draft(self, client: TestClient) -> None:
         req = self._base_request(
@@ -211,6 +220,70 @@ class TestDraft:
         body = r.json()
         assert body["documents_fetched"][0]["content_hash"] == expected_hash
 
+    def test_private_fetch_target_rejected(self, client: TestClient) -> None:
+        req = self._base_request(fetch_targets=[{"type": "other", "url": "http://127.0.0.1/admin"}])
+        r = client.post("/decisions/draft", json=req)
+        assert r.status_code == 400
+        assert "HTTPS" in r.json()["detail"]
+
+    def test_fetch_requires_operator_allowlist(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FETCH_ALLOWED_HOSTS")
+        r = client.post("/decisions/draft", json=self._base_request())
+        assert r.status_code == 400
+        assert "FETCH_ALLOWED_HOSTS" in r.json()["detail"]
+
+    def test_redirect_is_not_followed(self, client: TestClient) -> None:
+        req = self._base_request(
+            fetch_targets=[{"type": "other", "url": "https://acmetutor.example/.well-known/redirect.json"}]
+        )
+        r = client.post("/decisions/draft", json=req)
+        assert r.status_code == 200
+        assert r.json()["documents_fetched"] == []
+        assert "redirects are not allowed" in r.json()["fetch_errors"][0]
+
+    def test_draft_cannot_claim_publication(self, client: TestClient) -> None:
+        req = self._base_request(
+            publication={"is_public": True, "publication_uri": "https://buyer.example/decision.json"}
+        )
+        r = client.post("/decisions/draft", json=req)
+        assert r.status_code == 400
+        assert "draft cannot claim" in r.json()["detail"]
+
+    def test_authentication_is_required(self, client: TestClient) -> None:
+        r = client.post(
+            "/decisions/draft", json=self._base_request(), headers={"Authorization": "Bearer wrong"}
+        )
+        assert r.status_code == 401
+
+    def test_missing_configured_token_fails_closed(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("API_TOKEN")
+        r = client.post("/decisions/draft", json=self._base_request())
+        assert r.status_code == 503
+
+    def test_fetch_target_count_is_bounded(self, client: TestClient) -> None:
+        req = self._base_request(fetch_targets=self._base_request()["fetch_targets"] * 17)
+        r = client.post("/decisions/draft", json=req)
+        assert r.status_code == 422
+
+    def test_audit_event_omits_identifiers(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: list[dict[str, Any]] = []
+
+        async def capture(_client: httpx.AsyncClient, *, kind: str, payload: dict[str, Any]) -> None:
+            assert kind == "decision_card_drafted"
+            captured.append(payload)
+
+        monkeypatch.setattr(app_module.audit_stream, "emit", capture)
+        r = client.post("/decisions/draft", json=self._base_request())
+        assert r.status_code == 200
+        assert len(captured) == 1
+        assert "buyer" not in captured[0]
+        assert "vendor" not in captured[0]
+        assert "decision_id" not in captured[0]
+
 
 class TestValidate:
     def _valid_card(self) -> dict[str, Any]:
@@ -249,3 +322,9 @@ class TestValidate:
         body = r.json()
         errs = body["detail"]["errors"]
         assert any("conditions" in str(e.get("msg", "")) for e in errs)
+
+    def test_validate_requires_token(self, client: TestClient) -> None:
+        r = client.post(
+            "/decisions/validate", json=self._valid_card(), headers={"Authorization": "Bearer wrong"}
+        )
+        assert r.status_code == 401

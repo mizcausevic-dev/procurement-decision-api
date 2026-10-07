@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "procurement-decision-api"
-version = "0.1.1"
+version = "0.2.0"
 description = "FastAPI service that drafts AI Procurement Decision Cards (Kinetic Gain Protocol Suite spec #11) from a buyer rubric and vendor Suite documents. Optional audit-stream-py integration via AUDIT_STREAM_URL env var."
 readme = "README.md"
 license = "MIT"
@@ -17,7 +17,6 @@ keywords = [
     "decision-intelligence",
     "kinetic-gain-protocol-suite",
     "nist-ai-rmf",
-    "omb-m-24-10",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -58,6 +57,15 @@ Spec = "https://github.com/mizcausevic-dev/ai-procurement-decision-spec"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/procurement_decision_api"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

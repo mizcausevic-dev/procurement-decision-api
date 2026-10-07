@@ -92,7 +92,7 @@ class TestComposeRationale:
         assert "AcmeTutor Inc." in text
         assert "AcmeTutor 3.0" in text
         assert "approved with conditions" in text
-        assert "3 reviewed document" in text
+        assert "3 fetched vendor declaration" in text
 
     def test_lists_failing_criteria(self) -> None:
         rubric = [
