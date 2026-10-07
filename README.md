@@ -26,7 +26,7 @@ Agent Card                  │        fetched documents / rationale)
 
 ## Quick start
 
-From this checkout, use the v0.2.0 code. The published v0.1.1 package has the earlier API behavior.
+Use package v0.2.0 or this checkout for the draft-only API behavior described below. Version 0.1.1 has the earlier behavior.
 
 ```bash
 python -m pip install -e .
@@ -83,12 +83,12 @@ curl -s http://localhost:8088/decisions/draft \
       "https://springfield.edu/.well-known/aup.json"
     ],
     "rubric": [
-      { "id": "ferpa-compliance",         "result": "pass", "weight": 1.0 },
-      { "id": "coppa-compliance",         "result": "pass", "weight": 1.0 },
+      { "id": "ferpa-safeguards-reviewed", "result": "pass", "weight": 1.0 },
+      { "id": "coppa-safeguards-reviewed", "result": "pass", "weight": 1.0 },
       { "id": "no-training-on-student-data", "result": "pass-with-condition", "weight": 1.0,
         "notes": "Disclosure asserts no-training; require contractual confirmation." },
       { "id": "bias-audit-completed",     "result": "partial", "weight": 0.8,
-        "notes": "Audit current but due for refresh by 2026-09." }
+        "notes": "Audit refresh is due by 2026-12-01." }
     ],
     "conditions": [
       { "id": "no-training-restriction",
