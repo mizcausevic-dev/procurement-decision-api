@@ -7,7 +7,7 @@
 
 > A local-first drafting aid for buyer-side AI procurement records. A buyer must review, authorize, and sign any decision before publication.
 
-A FastAPI service that takes a buyer's own rubric judgments and fetches selected vendor [Kinetic Gain Protocol Suite](https://suite.kineticgain.com/) declarations, then returns a draft [AI Procurement Decision Card](https://github.com/mizcausevic-dev/ai-procurement-decision-spec). Package v0.2.0 implements the v0.1 card model; the upstream specification also has v0.2 and v0.3 fields that this service does not accept. The [NIST AI RMF crosswalk](https://suite.kineticgain.com/docs/nist-rmf-crosswalk.md) is informational, not a compliance determination or publication requirement.
+A FastAPI service that takes a buyer's own rubric judgments and fetches selected vendor [Kinetic Gain Protocol Suite](https://suite.kineticgain.com/) declarations, then returns a draft [AI Procurement Decision Card](https://github.com/mizcausevic-dev/ai-procurement-decision-spec). The v0.2.x source implements the v0.1 card model; the upstream specification also has v0.2 and v0.3 fields that this service does not accept. The [NIST AI RMF crosswalk](https://suite.kineticgain.com/docs/nist-rmf-crosswalk.md) is informational, not a compliance determination or publication requirement.
 
 ## The cross-ecosystem bridge
 
@@ -26,7 +26,7 @@ Agent Card                  │        fetched documents / rationale)
 
 ## Quick start
 
-Use package v0.2.0 or this checkout for the draft-only API behavior described below. Version 0.1.1 has the earlier behavior.
+Use a v0.2.x package or this checkout for the draft-only API behavior described below. Version 0.1.1 has the earlier behavior.
 
 ```bash
 python -m pip install -e .
@@ -114,7 +114,7 @@ In v0.2.0, the API always emits `draft.decision.status=pending`, even when `prop
 
 ## What the service does
 
-1. **Fetches** up to 16 operator-allowlisted HTTPS `/.well-known/*.json` URLs, without redirects, encoded paths, or query strings, concurrently with httpx. It rejects hosts whose DNS answers contain private or other non-public IPs at preflight time. Each response is streamed with a 2 MB cap and 10 s total timeout. Missing `FETCH_ALLOWED_HOSTS` rejects requests with fetch targets.
+1. **Fetches** up to 16 operator-allowlisted HTTPS `/.well-known/*.json` URLs, without redirects, encoded paths, or query strings, concurrently with httpx. It rejects hosts whose DNS answers contain private or other non-public IPs, then connects to checked IPs with the original TLS name. Each response is streamed with a 2 MB cap and 10 s total timeout. Missing `FETCH_ALLOWED_HOSTS` rejects requests with fetch targets.
 2. **Suggests** a status from the buyer-supplied rubric if you didn't supply `proposed_status`; the draft itself always remains `pending`. The suggestion rules:
    - Any `fail` → `rejected-with-remediation`
    - Any `partial` or `pass-with-condition` → `approved-with-conditions`
@@ -188,7 +188,8 @@ Pydantic v2 models implement the v0.1 fields and three conditional rules. They a
 
 - `API_TOKEN` is required for both POST endpoints and must contain at least 32 characters. Keep it in a secret store, rotate it through your deployment process, and send it only over TLS outside localhost. The token is a shared service-use credential with no tenant, role, audience, or buyer-authority claim. The CLI binds to `127.0.0.1` by default; the container listens inside its network namespace, so publish its port to localhost or place it behind a private gateway with caller-specific authorization.
 - POST request bodies are capped at 512 KiB and must arrive within 10 s. Authenticated decision operations are limited to 60 requests per rolling minute per process, with `429` and `Retry-After` on excess. Use the gateway for distributed rate limits and unauthenticated floods.
-- `FETCH_ALLOWED_HOSTS` is a comma-separated list of exact DNS names controlled by the operator. Only HTTPS port 443, unencoded `/.well-known/*.json` paths without credentials, queries, fragments, or redirects are fetched. An initial DNS lookup rejects non-public IP answers and HTTP clients ignore proxy environment variables. DNS can change before the connection, so production egress rules must block private, loopback, link-local, and metadata destinations at the network boundary.
+- `FETCH_ALLOWED_HOSTS` is a comma-separated list of exact DNS names controlled by the operator. Only HTTPS port 443, unencoded `/.well-known/*.json` paths without credentials, queries, fragments, or redirects are fetched. DNS answers must all be public; the HTTP request tries checked IPs within one timeout while preserving the original hostname for HTTP Host and TLS SNI/certificate verification. Clients ignore proxy environment variables and do not retain idle connections. A deployed service still needs network-level egress rules blocking private, loopback, link-local, and metadata destinations and an actual network probe before real vendor fetching.
+- Set `PROCUREMENT_SYNTHETIC_PILOT=1` for a private synthetic pilot. This rejects every request containing a vendor fetch target even when `FETCH_ALLOWED_HOSTS` is configured, before any DNS lookup or HTTP connection. Requests with no fetch targets still draft pending cards. Startup rejects an `AUDIT_STREAM_URL` setting in this mode. The only accepted values are `0` (default) and `1`. Restrict pilot callers and inputs to synthetic fixtures; this switch cannot classify whether a submitted card is synthetic or establish a production egress boundary for real vendor fetching.
 - Fetched JSON is treated as untrusted data. The parser requires an object, rejects duplicate keys, and rejects values outside the RFC 8785 canonicalization domain. The service does not validate a vendor declaration against its own Suite schema, verify a signature, or confirm the vendor's claims. Per-target failures are returned; the buyer must decide whether missing evidence changes the outcome.
 - `AUDIT_STREAM_URL` is optional. When enabled, the emitted event contains status and counts only; it omits buyer/vendor names and decision IDs. This service has no persistent draft store, but clients, proxies, and the audit destination need access, retention, and deletion policies. Decision responses request `Cache-Control: no-store`; configure the gateway and clients to honor it. `/docs` and `/openapi.json` remain public metadata endpoints.
 - The Docker base is pinned by digest and its runtime dependencies are resolved from `uv.lock`. The recipe still needs a successful Linux image build and exact image-digest check in CI. No tenant authorization, verified buyer reviewer, signing workflow, or network-level egress rule is provided here. Keep the service private until those deployment controls are verified.

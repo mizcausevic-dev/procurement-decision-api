@@ -87,6 +87,100 @@ async def test_private_dns_answer_rejected_before_network(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_fetch_connects_to_checked_ip_with_original_host_and_sni(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"name": "Vendor"})
+
+    target = FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        documents, errors = await fetch_documents([target], client=client)
+
+    assert errors == []
+    assert len(documents) == 1
+    assert documents[0].reference.url == target.url
+    assert len(requests) == 1
+    assert requests[0].url.host == "1.1.1.1"
+    assert requests[0].headers["host"] == "vendor.example"
+    assert requests[0].extensions["sni_hostname"] == "vendor.example"
+
+
+@pytest.mark.asyncio
+async def test_fetch_falls_back_to_second_checked_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
+
+    async def dual_stack(_host: str) -> list[str]:
+        return ["2606:4700:4700::1111", "1.1.1.1"]
+
+    monkeypatch.setattr("procurement_decision_api.fetcher._resolve_host_addresses", dual_stack)
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            raise httpx.ConnectError("first IP unreachable", request=request)
+        return httpx.Response(200, json={"name": "Vendor"})
+
+    target = FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        documents, errors = await fetch_documents([target], client=client)
+
+    assert errors == []
+    assert len(documents) == 1
+    assert len(requests) == 2
+    assert requests[0].url.host == "2606:4700:4700::1111"
+    assert requests[1].url.host == "1.1.1.1"
+    assert all(request.headers["host"] == "vendor.example" for request in requests)
+    assert all(request.extensions["sni_hostname"] == "vendor.example" for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_fetch_error_omits_checked_ip_and_transport_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("1.1.1.1:443 private network detail", request=request)
+
+    target = FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as client:
+        documents, errors = await fetch_documents([target], client=client)
+
+    assert documents == []
+    assert errors == [f"{target.url}: network request failed"]
+
+
+@pytest.mark.asyncio
+async def test_synthetic_pilot_forbids_fetch_even_with_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PROCUREMENT_SYNTHETIC_PILOT", "1")
+    monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
+    requests: list[httpx.Request] = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: requests.append(r) or httpx.Response(200))
+    ) as client:
+        with pytest.raises(ValueError, match="synthetic pilot forbids remote vendor fetch"):
+            await fetch_documents(
+                [FetchTarget(type="aeo", url="https://vendor.example/.well-known/aeo.json")],
+                client=client,
+            )
+        assert await fetch_documents([], client=client) == ([], [])
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_synthetic_pilot_setting_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PROCUREMENT_SYNTHETIC_PILOT", "yes")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        await fetch_documents([])
+
+
+@pytest.mark.asyncio
 async def test_unavailable_dns_is_per_target_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FETCH_ALLOWED_HOSTS", "vendor.example")
 
