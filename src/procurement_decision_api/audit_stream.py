@@ -1,9 +1,10 @@
 """
 Optional audit-stream-py integration.
 
-When the `AUDIT_STREAM_URL` env var is set, this module fires
-governance events at `{AUDIT_STREAM_URL}/events` for the moments the
-service produces. Best-effort: a failed POST is logged, not raised —
+When `AUDIT_STREAM_URL` is set to the sink base URL (or its `/events`
+endpoint), this module fires governance events at the normalized endpoint.
+`AUDIT_STREAM_TOKEN` supplies the sink's bearer credential. Best-effort:
+a failed POST is logged, not raised —
 audit-stream outages must never block decision drafting.
 
 Set `AUDIT_STREAM_URL=` (empty) or unset to disable. Set
@@ -12,10 +13,13 @@ Set `AUDIT_STREAM_URL=` (empty) or unset to disable. Set
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 import sys
 from math import isfinite
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -33,6 +37,43 @@ def base_url() -> str | None:
     if not raw:
         return None
     return raw.rstrip("/")
+
+
+def events_url() -> str | None:
+    """Normalize a sink base or exact `/events` URL without forwarding URL credentials."""
+    raw = base_url()
+    if raw is None:
+        return None
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    if parsed.scheme == "http":
+        try:
+            if not ipaddress.ip_address(hostname or "").is_loopback:
+                return None
+        except ValueError:
+            return None
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/events"):
+        path += "/events"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def audit_token() -> str | None:
+    """Return only a token accepted by the sink's configured-token syntax."""
+    token = os.environ.get("AUDIT_STREAM_TOKEN", "")
+    return token if re.fullmatch(r"[!-~]{32,}", token) else None
 
 
 def timeout_s() -> float:
@@ -59,8 +100,12 @@ async def emit(
     Failures (timeout, 5xx, connection refused) are swallowed and printed
     to stderr — audit-stream is the consumer, never the dependency.
     """
-    url = base_url()
-    if url is None:
+    if not is_enabled():
+        return
+    url = events_url()
+    token = audit_token()
+    if url is None or token is None:
+        print(f"audit-stream emit failed (kind={kind}): InvalidConfiguration", file=sys.stderr, flush=True)
         return
 
     body = {
@@ -70,11 +115,19 @@ async def emit(
     }
     try:
         response = await client.post(
-            f"{url}/events",
+            url,
             json=body,
+            headers={"Authorization": f"Bearer {token}"},
+            follow_redirects=False,
             timeout=timeout_s(),
         )
         response.raise_for_status()
+    except httpx.HTTPStatusError as err:
+        print(
+            f"audit-stream emit failed (kind={kind}): HTTPStatusError status={err.response.status_code}",
+            file=sys.stderr,
+            flush=True,
+        )
     except (httpx.HTTPError, OSError) as err:
         # Best-effort. Print but don't raise.
         # Exception messages may contain a configured URL with credentials.
