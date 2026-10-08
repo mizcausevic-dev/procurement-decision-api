@@ -36,10 +36,13 @@ from .models import DecisionCard, DraftRequest, DraftResponse
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Hold a single shared httpx.AsyncClient for the lifetime of the app."""
+    if os.environ.get("PROCUREMENT_SYNTHETIC_PILOT") == "1" and os.environ.get("AUDIT_STREAM_URL"):
+        raise RuntimeError("synthetic pilot forbids outbound AUDIT_STREAM_URL")
     app.state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(DEFAULT_TIMEOUT_S),
         follow_redirects=False,
         trust_env=False,
+        limits=httpx.Limits(max_keepalive_connections=0),
         headers={"User-Agent": f"procurement-decision-api/{__version__} (+https://kineticgain.com)"},
     )
     try:

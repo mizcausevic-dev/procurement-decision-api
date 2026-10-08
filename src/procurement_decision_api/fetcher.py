@@ -87,22 +87,25 @@ async def _resolve_host_addresses(host: str) -> list[str]:
     return [str(answer[4][0]) for answer in answers]
 
 
-async def _check_public_dns(targets: list[FetchTarget]) -> dict[str, str]:
-    """Reject non-public answers and collect unavailable DNS as per-target errors."""
+async def _check_public_dns(targets: list[FetchTarget]) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Return checked connection IPs; reject non-public answers before network I/O."""
     hosts = {httpx.URL(target.url).host for target in targets}
 
-    async def check(host: str | None) -> tuple[str, str | None]:
+    async def check(host: str | None) -> tuple[str, list[str] | None, str | None]:
         if host is None:
             raise ValueError("Fetch target hostname is missing")
         try:
             addresses = await asyncio.wait_for(_resolve_host_addresses(host), timeout=DNS_TIMEOUT_S)
         except (OSError, TimeoutError):
-            return host, "DNS resolution failed"
+            return host, None, "DNS resolution failed"
         if not addresses or any(not ipaddress.ip_address(value).is_global for value in addresses):
             raise ValueError("Fetch target DNS must resolve only to public IP addresses")
-        return host, None
+        return host, addresses, None
 
-    return {host: error for host, error in await asyncio.gather(*(check(host) for host in hosts)) if error}
+    checked = await asyncio.gather(*(check(host) for host in hosts))
+    addresses = {host: address for host, address, _ in checked if address is not None}
+    errors = {host: error for host, _, error in checked if error is not None}
+    return addresses, errors
 
 
 class FetchedDocument:
@@ -143,13 +146,23 @@ async def _fetch_one(
     client: httpx.AsyncClient,
     target: FetchTarget,
     *,
+    connect_address: str,
     max_bytes: int,
 ) -> tuple[FetchedDocument | None, str | None]:
     """Fetch one target. Returns (doc, None) on success or (None, error) on failure."""
     try:
         # Stream so an untrusted server cannot make httpx buffer an unbounded body.
         # Redirects are never followed, even if a supplied client enables them.
-        async with client.stream("GET", target.url, follow_redirects=False) as response:
+        original_url = httpx.URL(target.url)
+        assert original_url.host is not None
+        pinned_url = original_url.copy_with(host=connect_address)
+        async with client.stream(
+            "GET",
+            pinned_url,
+            headers={"Host": original_url.host, "Connection": "close"},
+            extensions={"sni_hostname": original_url.host},
+            follow_redirects=False,
+        ) as response:
             if response.is_redirect:
                 return None, f"{target.url}: redirects are not allowed"
             response.raise_for_status()
@@ -198,22 +211,38 @@ async def _fetch_one(
         )
         return FetchedDocument(reference, document_hash), None
 
-    except httpx.TimeoutException:
-        return None, f"{target.url}: timeout"
     except httpx.HTTPStatusError as err:
         return None, f"{target.url}: HTTP {err.response.status_code}"
-    except httpx.RequestError as err:
-        return None, f"{target.url}: {type(err).__name__}: {err}"
 
 
 async def _fetch_limited(
-    client: httpx.AsyncClient, target: FetchTarget, *, timeout_s: float, max_bytes: int
+    client: httpx.AsyncClient,
+    target: FetchTarget,
+    *,
+    connect_addresses: list[str],
+    timeout_s: float,
+    max_bytes: int,
 ) -> tuple[FetchedDocument | None, str | None]:
-    """Cap the entire retrieval, not just each individual network operation."""
-    try:
-        return await asyncio.wait_for(_fetch_one(client, target, max_bytes=max_bytes), timeout=timeout_s)
-    except TimeoutError:
-        return None, f"{target.url}: timeout"
+    """Try checked IPs under one deadline; keep transport details out of responses."""
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    last_error = f"{target.url}: network request failed"
+    for index, address in enumerate(connect_addresses):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return None, f"{target.url}: timeout"
+        # Reserve time for later checked addresses when a dual-stack endpoint stalls.
+        attempt_timeout = remaining / (len(connect_addresses) - index)
+        try:
+            return await asyncio.wait_for(
+                _fetch_one(client, target, connect_address=address, max_bytes=max_bytes),
+                timeout=attempt_timeout,
+            )
+        except (TimeoutError, httpx.TimeoutException):
+            last_error = f"{target.url}: timeout"
+        except httpx.RequestError:
+            # Transport exceptions can include pinned IPs and network details.
+            last_error = f"{target.url}: network request failed"
+    return None, last_error
 
 
 async def fetch_documents(
@@ -228,11 +257,16 @@ async def fetch_documents(
 
     Tests can pass a pre-configured `client` to mock vendor responses.
     """
+    pilot_mode = os.environ.get("PROCUREMENT_SYNTHETIC_PILOT", "0")
+    if pilot_mode not in {"0", "1"}:
+        raise ValueError("PROCUREMENT_SYNTHETIC_PILOT must be 0 or 1")
+    if pilot_mode == "1" and targets:
+        raise ValueError("synthetic pilot forbids remote vendor fetch targets")
     if not targets:
         return [], []
 
     _check_targets(targets)
-    dns_errors = await _check_public_dns(targets)
+    checked_addresses, dns_errors = await _check_public_dns(targets)
 
     own_client = client is None
     if client is None:
@@ -240,6 +274,7 @@ async def fetch_documents(
             timeout=httpx.Timeout(timeout_s),
             follow_redirects=False,
             trust_env=False,
+            limits=httpx.Limits(max_keepalive_connections=0),
             headers={"User-Agent": f"procurement-decision-api/{__version__} (+https://kineticgain.com)"},
         )
 
@@ -249,7 +284,14 @@ async def fetch_documents(
             host = httpx.URL(target.url).host
             if host is not None and host in dns_errors:
                 return None, f"{target.url}: {dns_errors[host]}"
-            return await _fetch_limited(client, target, timeout_s=timeout_s, max_bytes=max_bytes)
+            assert host is not None
+            return await _fetch_limited(
+                client,
+                target,
+                connect_addresses=checked_addresses[host],
+                timeout_s=timeout_s,
+                max_bytes=max_bytes,
+            )
 
         results = await asyncio.gather(*(run(target) for target in targets))
     finally:

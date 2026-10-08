@@ -87,6 +87,13 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
 
 class TestMetaEndpoints:
+    def test_synthetic_pilot_rejects_outbound_audit_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PROCUREMENT_SYNTHETIC_PILOT", "1")
+        monkeypatch.setenv("AUDIT_STREAM_URL", "https://audit.example/events")
+        with pytest.raises(RuntimeError, match="forbids outbound AUDIT_STREAM_URL"):
+            with TestClient(app):
+                pass
+
     def test_root(self, client: TestClient) -> None:
         r = client.get("/")
         assert r.status_code == 200
@@ -223,6 +230,23 @@ class TestDraft:
         assert r.status_code == 200
         body = r.json()
         assert body["documents_fetched"] == []
+
+    def test_synthetic_pilot_blocks_fetch_at_api_boundary(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PROCUREMENT_SYNTHETIC_PILOT", "1")
+
+        async def unexpected_dns(_host: str) -> list[str]:
+            raise AssertionError("synthetic pilot must not resolve a vendor hostname")
+
+        monkeypatch.setattr("procurement_decision_api.fetcher._resolve_host_addresses", unexpected_dns)
+        blocked = client.post("/decisions/draft", json=self._base_request())
+        assert blocked.status_code == 400
+        assert "synthetic pilot forbids remote vendor fetch" in blocked.json()["detail"]
+
+        allowed = client.post("/decisions/draft", json=self._base_request(fetch_targets=[]))
+        assert allowed.status_code == 200
+        assert allowed.json()["draft"]["decision"]["status"] == "pending"
 
     def test_rationale_template_passed_through(self, client: TestClient) -> None:
         req = self._base_request(rationale_template="My custom rationale text.")
