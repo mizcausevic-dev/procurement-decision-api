@@ -9,6 +9,13 @@ import pytest
 
 from procurement_decision_api import audit_stream
 
+TEST_AUDIT_TOKEN = "a" * 32
+
+
+@pytest.fixture(autouse=True)
+def configured_audit_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_AUDIT_TOKEN)
+
 
 class TestConfig:
     def test_disabled_when_env_var_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -29,6 +36,17 @@ class TestConfig:
     def test_trailing_slash_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("AUDIT_STREAM_URL", "http://localhost:8093/")
         assert audit_stream.base_url() == "http://localhost:8093"
+
+    def test_base_and_endpoint_url_normalize_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_URL", "http://localhost:8093/private/")
+        assert audit_stream.events_url() == "http://localhost:8093/private/events"
+        monkeypatch.setenv("AUDIT_STREAM_URL", "http://localhost:8093/private/events/")
+        assert audit_stream.events_url() == "http://localhost:8093/private/events"
+
+    @pytest.mark.parametrize("value", ["http://user:password@audit.local", "http://audit.local?token=x"])
+    def test_url_credentials_are_rejected(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_URL", value)
+        assert audit_stream.events_url() is None
 
     def test_timeout_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("AUDIT_STREAM_TIMEOUT_S", raising=False)
@@ -72,6 +90,7 @@ class TestEmit:
         def handler(request: httpx.Request) -> httpx.Response:
             assert str(request.url) == "http://audit.local/events"
             assert request.method == "POST"
+            assert request.headers["Authorization"] == f"Bearer {TEST_AUDIT_TOKEN}"
             import json
 
             captured.append(json.loads(request.content.decode("utf-8")))
@@ -118,3 +137,40 @@ class TestEmit:
         async with httpx.AsyncClient(transport=transport) as client:
             # Must not raise.
             await audit_stream.emit(client, kind="decision_card_drafted", payload={})
+
+    @pytest.mark.asyncio
+    async def test_missing_token_prevents_outbound_request_and_logs_without_secret(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_URL", "http://audit.local")
+        monkeypatch.setenv("AUDIT_STREAM_TOKEN", "short-private-token")
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(201)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await audit_stream.emit(client, kind="decision_card_drafted", payload={})
+        assert captured == []
+        error = capsys.readouterr().err
+        assert "InvalidConfiguration" in error
+        assert "short-private-token" not in error
+
+    @pytest.mark.asyncio
+    async def test_rejected_token_is_failed_delivery_without_secret_log(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_URL", "http://audit.local/events")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert str(request.url) == "http://audit.local/events"
+            assert request.headers["Authorization"] == f"Bearer {TEST_AUDIT_TOKEN}"
+            return httpx.Response(401)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await audit_stream.emit(client, kind="decision_card_drafted", payload={})
+        error = capsys.readouterr().err
+        assert "HTTPStatusError" in error
+        assert "status=401" in error
+        assert TEST_AUDIT_TOKEN not in error
